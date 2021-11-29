@@ -1,0 +1,2 @@
+SET(sharemind-hi_ROOT "/path/to/sharemind-hardware-isolation.git/prefix")
+SET(SgxSdk_ROOT "/path/to/sharemind-hi-dependencies.git/prefix/sgxsdk")

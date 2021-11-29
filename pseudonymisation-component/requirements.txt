@@ -1,0 +1,14 @@
+cffi==1.14.5
+click==7.1.2
+cryptography==3.4.7
+Flask==1.1.2
+gunicorn==20.0.4
+itsdangerous==1.1.0
+Jinja2==2.11.3
+MarkupSafe==1.1.1
+pycparser==2.20
+pydantic==1.8.1
+python-dotenv==0.15.0
+PyYAML==5.4.1
+typing-extensions==3.7.4.3
+Werkzeug==1.0.1

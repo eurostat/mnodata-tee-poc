@@ -1,0 +1,1582 @@
+#!/bin/bash
+#
+# Copyright 2021 European Union
+#
+# Licensed under the EUPL, Version 1.2 or – as soon they will be approved by 
+# the European Commission - subsequent versions of the EUPL (the "Licence");
+# You may not use this work except in compliance with the Licence.
+# You may obtain a copy of the Licence at:
+#
+# https://joinup.ec.europa.eu/software/page/eupl
+#
+# Unless required by applicable law or agreed to in writing, software 
+# distributed under the Licence is distributed on an "AS IS" basis,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the Licence for the specific language governing permissions and 
+# limitations under the Licence.
+#
+
+set -euo pipefail
+#set -x
+
+# Make sure that intermediate files are not accessible by other users.
+umask 077
+
+######
+# Help and error functions
+######
+
+print_help() {
+    local -
+    set +e
+    local cmd="sharemind-hi-vad"
+    cat << EOF
+$cmd
+
+Usage:
+  $cmd automatic-h-file-import [Common options] [Options for \`automatic-h-file-import\`]
+  $cmd finish-report [Common options]
+
+The first invocation looks for new importable H files, initiates analysis with these, and exports results when possible.
+
+The second invocation manually forces concluding the analysis and compilation of the last report.
+
+Common options:
+  -s --sharemind-client-config <file>     Client configuration file.
+  -o --output-dir <directory>             Directory where to store the downloaded data.
+  -p --progress-callback <application>    Path to an application which will be called.
+                               application is given a single argument, the path
+                               to a file which contains the status report. If the
+                               script exits with an error code, the progress state
+                               is not saved and the next progress report will contain
+                               the same progress data plus any new progress data.
+                               If no progress report is needed, supply "true"
+                               (/usr/bin/true).
+
+Options for \`automatic-h-file-import\`
+  -i --h-file-import-dir <directory>      Input H file input directory.
+  -b --old-h-files "keep/delete"          Behaviour for H files after analysis.
+EOF
+    return 0
+}
+
+# Exit in piece.
+finish() {
+    echo "$*"
+    exit 0
+}
+
+die() {
+    >&2 echo "$*"
+    exit 1
+}
+
+help_and_die() {
+    >&2 echo "$*"
+    >&2 print_help
+    exit 1
+}
+
+report() {
+    # TODO evaluate if this function is at all required.
+    # Prints with a newline before and after to make it visually stick out a bit,
+    # as the other output from the sharemind-hi tools might produce a lot of
+    # other output.
+    printf "\n=== %s ===\n\n" "$*"
+}
+
+######
+# Argument parsing
+######
+
+# The argument parsing as realized here is done in a way to allow parsing a
+# argument trough a single line, see `parse_scalar` examples.
+# The plus is that it makes the usage side rather pleasant, its just a single
+# line where all relevant is stated.
+# The con is that unused arguments are not detected, and the arguments are
+# searched through for each `parse_*` call.
+# The alternative, a large `while [ "$#" -gt 0 ]; do .. shift ... done` only
+# does a single run, detects unused arguments, but variable declaration is
+# scattered across many places. Code readability is more important here than
+# detecting unused argument (yeah, funny to read that in a Bash program).
+
+if [ "$#" -eq 0 ]; then
+    help_and_die
+elif [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    print_help
+    exit 0
+fi
+
+# These variables are declared beforehand, so shellcheck does not complain about
+# their usage. They are populated with through the "nameref" mechanism, which
+# seems to be impenetrable for shellcheck.
+client_config=""
+output_dir=""
+output_file=""
+old_file_behaviour=""
+import_dir=""
+progress_callback_command=""
+
+declare -a out_array
+
+# The first cli argument is an action to perform. The actual expected arguments
+# differ based on the first argument.
+action="$1"
+shift
+# The rest of the arguments are stored in the `arguments` array to be looked
+# through in the `parse_arg` function.
+arguments=("$@")
+
+# E.g. "3" -> "1970-01-04"
+period_to_date() {
+    date --utc -Idate --date='@'"$(( "$1" * 86400 ))"
+}
+
+# E.g. "1970-01-04" -> "3"
+date_to_period() {
+    echo "$(( $(date --utc --date "$1" '+%s') / 86400))"
+}
+
+arg_convert() {
+    # $1: value to convert/typecheck
+    # $2: cli-flag regex for error reporting
+    # $3: conversion
+
+    case "$3" in
+        number)
+            if ! [[ "$1" =~ ^-?[0-9]+$ ]]; then
+                help_and_die "Value <$1> supplied to <$2> should be a number (^[0-9]+$), but it is not."
+            fi
+            echo "$1"
+            ;;
+        realpath)
+            # This path needs to exist, as we want to read from it. Yes,
+            # TOCTOU, but this is a best-effort test, and otherwise at the
+            # usage-side it will fail, anyway.
+            # `cd` needs to be performed in its subshell to not modify $PWD.
+            (cd "$original_dir" && realpath -e "$1") \
+                || help_and_die "Value <$1> supplied to <$2> does not point to an existing file or directory."
+            ;;
+        path)
+            # This path does not need to exist, it is likely an output path
+            # to be created.
+            # `cd` needs to be performed in its subshell to not modify $PWD.
+            (cd "$original_dir" && realpath "$1") \
+                || help_and_die "Value <$1> supplied to <$2> could not be resolved to a full path."
+            ;;
+        executable)
+            if ! command -v "$1" >/dev/null 2>&1; then
+                help_and_die "Value <$1> supplied to <$2> is not a callable executable."
+            fi
+            echo "$1"
+            ;;
+        verbatim)
+            # Perform no sanitization for this type of argument
+            echo "$1"
+            ;;
+        *)
+            die "Unknown arg_convert type <$3>"
+            ;;
+    esac
+}
+
+parse_scalar() {
+    local -
+    set +x
+    # $1: variable name
+    # $2: cli-flag regex
+    # $3: conversion
+
+    # A "nameref" to the variable in the outer scope.
+    declare -n outer_scope_variable="$1"
+    local key_regex="$2"
+    local conversion="$3"
+    local num_args="${#arguments[@]}"
+    local i
+
+    for (( i=0; i<num_args - 1; ++i )); do
+        if [[ "${arguments[$i]}" =~ ^$key_regex$ ]]; then
+            # shellcheck disable=SC2034
+            outer_scope_variable="$(arg_convert "${arguments[i+1]}" "$key_regex" "$conversion")"
+            return 0
+        fi
+    done
+
+    help_and_die "Missing argument $key_regex"
+}
+
+######
+# Working directory setup
+######
+
+# The command line arguments are probably given in relative paths, so we need
+# to store the initial working directory before switching to a temporary
+# directory, so we can transform them into the correct absolute paths during
+# argument parsing.
+readonly original_dir="$PWD"
+working_directory="$(mktemp -d --tmpdir sharemind-hi-vad.XXXXXXXXXX)"
+readonly working_directory
+export TMPDIR="$working_directory" # Make sure that all temporary files are created in here.
+pushd "$working_directory" >/dev/null
+
+cleanup() {
+    rm -rf "$working_directory"
+}
+
+trap "cleanup" EXIT
+
+######
+# Application logic
+#   First defining a bunch of functions, the actual entry point it at the bottom.
+######
+
+tile_idx=(unsigned:2 unsigned:2)
+
+data_to_csv() {
+    # $1: topic -> in file: $1.data, out file: $output_dir/$1.csv
+    # $2: csv header
+    # $3: output_directory
+    # $@: columns
+
+    local topic="$1"
+    local csv_header="$2"
+    local output_dir="$3"
+    shift; shift; shift;
+    local columns=("$@")
+
+    local in="$topic.data"
+    local out="$output_dir/$topic.csv"
+
+    printf "%s\n" "$csv_header" >"$out"
+
+    sharemind-hi-data-converter \
+        -m bin2csv \
+        -c tmp_file \
+        -b "$in" \
+        --sep ',' \
+        -t "${columns[@]}"
+    cat tmp_file >>"$out"
+    rm -f tmp_file >/dev/null 2>&1
+}
+
+get_hi_dfc() {
+    local client_config="$1"
+
+    # Download DFC to parse the task instance list
+    # to find the last task instance for log parsing
+    sharemind-hi-client \
+        -c "$client_config" \
+        -a displayDfc \
+        | perl -MYAML::XS -MJSON::XS -0777e'CORE::say encode_json(Load(<>))'
+}
+
+assert_no_pending() {
+    local client_config="$1"
+    local last_inst
+
+    last_inst="$(get_hi_dfc "$client_config" \
+            | jq '.Tasks[] | select(.Name == "analytics_enclave") | .Instances[-1].Status')"
+    if [[ "$last_inst" =~ (Initializing|Pending|Running) ]]; then
+        die "Some analytics enclave instance is in an unexpected state, !"
+    fi
+}
+
+download_application_log() {
+    local client_config="$1"
+    local out_file="$2"
+    local task_instance="$3"
+
+    get_hi_dfc "$client_config" \
+        | jq '.Tasks[] | select(.Name == "analytics_enclave") | .Instances' \
+        > taskinstances.json
+    local length
+    length="$(<taskinstances.json jq 'length')"
+    if [ "$length" -eq 0 ]; then
+        # no task instance found, script itself ought not end up here.
+        return 1
+    fi
+    if [[ "$(<taskinstances.json jq -r '.['"$task_instance"'].Status')" != "Finished" ]]; then
+        return 1
+    fi
+    local dataid
+    dataid=$(<taskinstances.json jq -r '.['"$task_instance"'].Outputs[] | select(.Topic == "application_log") | .Id')
+    if [[ "$dataid" == "" ]]; then
+        return 1
+    fi
+
+    sharemind-hi-client \
+        -c "$client_config" \
+        -a dataDownload \
+        -- \
+        --topic "application_log" \
+        --dataid "$dataid" \
+        --datafile "$out_file"
+    return 0
+}
+
+download_last_application_log() {
+    local client_config="$1"
+    local out_file="$2"
+
+    get_hi_dfc "$client_config" \
+       | jq '.Tasks[] | select(.Name == "analytics_enclave") | .Instances' \
+       > taskinstances.json
+    local length
+    length="$(<taskinstances.json jq 'length')"
+    if [ "$length" -eq 0 ]; then
+        # no task instance found, script itself ought not end up here.
+        return 1
+    fi
+
+    local status
+    local last_success
+    for i in $(seq 1 "${length}"); do
+        status="$(<taskinstances.json jq -r '.[-'"$i"'].Status')"
+        case "$status" in
+            Finished)
+                last_success="$i"
+                break
+                ;;
+            Failed)
+                continue
+                ;;
+            Initializing|Pending|Running)
+                continue
+                ;;
+            *)
+                continue
+                ;;
+        esac
+    done
+    if [[ "$last_success" == "" ]]; then
+        return 1
+    fi
+
+    # Using the rather short name "ti.json" as otherwise lines become very long.
+    <taskinstances.json jq ".[-$last_success]" >ti.json
+
+    local status
+    status="$(<ti.json jq -r '.Status')"
+    case "$status" in
+        Finished)
+            # Great, best case. Continue with this happy case afterwards.
+            ;;
+        Failed)
+            errMsg="$(<ti.json jq -r '.["Error message"]')"
+            errCode="$(<ti.json jq -r '.["Task enclave error code"]')"
+            die "The task instance failed and thus did not produce any outputs." \
+                "\nError message: $errMsg, code: $errCode"
+            ;;
+        Initializing|Pending|Running)
+            die "The task instance is not finished yet ($status)."
+            ;;
+        *)
+            die "Unknown status <$status> in task instance:\n$(<ti.json)"
+            ;;
+    esac
+
+    local dataid
+    dataid=$(<ti.json jq -r '.Outputs[] | select(.Topic == "application_log") | .Id')
+    
+    # download app log
+    sharemind-hi-client \
+        -c "$client_config" \
+        -a dataDownload \
+        -- \
+        --topic "application_log" \
+        --dataid "$dataid" \
+        --datafile "$out_file"
+    return 0
+}
+
+get_last_period_and_status() {
+    local client_config="$1"
+    <<<"$(get_hi_dfc "$client_config")" jq '.Tasks[] | select(.Name == "analytics_enclave") | .Instances' >taskinstances.json
+    if [ "$(<taskinstances.json jq 'length')" -eq 0 ]; then
+        return 1
+    fi
+
+    # TODO skip invalid instances which contain ":AE01:" in their error message -
+    # maybe this could be done once to sanitize the taskinstances.json and then
+    # reuse it everywhere?
+    <taskinstances.json jq '.[-1]' >last.json
+
+    # Output the period, success is given as return code of the function.
+    <last.json jq -r '.Arguments[] | select(.Key == "period") | .Value'
+
+    local status
+    status="$(<taskinstances.json jq -r '.[-1].Status')"
+    case "$status" in
+        Finished)
+            return 0
+            ;;
+        Failed)
+            return 1
+            ;;
+        Initializing|Pending|Running)
+            die "The task instance is not finished yet ($status), locking has failed/been overriden, continuing is dangerous."
+            ;;
+        *)
+            die "Unknown status <$status> in task instance:\n$(<last.json)"
+            ;;
+    esac
+    return 1
+}
+
+parse_application_log_to_period() {
+    local application_log="$1"
+
+    local -
+    set +x
+
+    local re
+    re="First period: ([0-9]+), last period: ([0-9]+)\s+Expected next period: ([0-9]+)"
+    if [[ "$(<"$application_log")" =~ $re ]]; then
+        # Existing run, handing out incremented expected period 
+        echo "${BASH_REMATCH[1]} $((BASH_REMATCH[3]+1)) ${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    re="First period: ([0-9]+), last period: ([0-9]+)"
+    if [[ "$(<"$application_log")" =~ $re ]]; then
+        # New request arrived.
+        echo "${BASH_REMATCH[1]} -1 ${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    re="Waited for new NSI request, nothing came, going back to sleep"
+    if [[ "$(<"$application_log")" =~ $re ]]; then
+        # No request available
+        return 0
+    fi
+
+    die "Invalid application log content."
+}
+
+download_single_report() {
+    # $1: taskinstances.json
+    # $2: task instance id
+    # $3: period_first
+    # $4: period_last
+    # $5: output dir
+
+    local date_first date_last
+    date_first="$(period_to_date "$3")"
+    date_last="$(period_to_date "$4")"
+    local output_dir="$5/$date_first-$date_last"
+    report "Download report from $date_first to $date_last"
+
+    # Using the rather short name "ti.json" as otherwise lines become very long.
+    <"$1" jq ".[$2]" >ti.json
+
+    # Download all the topics.
+    for topic in \
+        fingerprint_report \
+        functional_urban_fingerprint_report \
+        top_anchor_distribution_report \
+        statistics \
+        application_log; do
+        <ti.json jq -jr '(.Outputs[] | select(.Topic == "'$topic'") | .Id) // null' >dataid.json
+        if [ "$(<dataid.json)" = "null" ]; then
+            >&2 echo "No data for topic <$topic> exists. Creating an empty file instead."
+            # Normalize the output from this function - make sure that all data
+            # files are present, even if empty.
+            touch "$topic.data"
+            continue;
+        fi
+
+        report "Downloading <$topic> data."
+        sharemind-hi-client \
+            -c "$client_config" \
+            -a dataDownload \
+            -- \
+                --topic "$topic" \
+                --dataid "$(<dataid.json)" \
+                --datafile "$topic.data"
+    done
+
+    report "Converting the downloaded data to the final format."
+
+    # Make sure that the output directory exists before writing to that directory.
+    mkdir -p "$output_dir"
+
+    data_to_csv \
+        "fingerprint_report" \
+        "tile_e,tile_n,value_0,value_1,value_2,value_3" \
+        "$output_dir" \
+        "${tile_idx[@]}" float:8 float:8 float:8 float:8
+
+    data_to_csv \
+        "top_anchor_distribution_report" \
+        "tile_e,tile_n,value" \
+        "$output_dir" \
+        "${tile_idx[@]}" unsigned:4
+
+    data_to_csv \
+        "functional_urban_fingerprint_report" \
+        "reference_area,tile_e,tile_n,strength" \
+        "$output_dir" \
+        unsigned:1 "${tile_idx[@]}" float:8
+
+    cp application_log.data "$output_dir/application_log.txt"
+
+    # This is only ever a single row, but for uniformity this might be better
+    # than any other attempt at structuring it (json? yaml? ini? toml? xml? csv!).
+    data_to_csv \
+        "statistics" \
+        "highly_nomadic_users,observed_total_users,adjusted_total_users" \
+        "$output_dir" \
+        unsigned:4 unsigned:4 float:8
+
+}
+
+finish_or_cancel_report() {
+    finish_or_cancel_report_inner "$@" || true
+}
+
+finish_or_cancel_report_inner() {
+    local client_config="$1"
+    local report_first="$2"
+    local report_last="$3"
+
+    if ! finish_report_inner "$client_config" "$report_first" "$report_last"; then
+        report "Could not finish the report, cancelling it instead."
+        cancel_report_inner "$client_config"
+        return 1
+    fi
+    report "Successfully compiled the report for periods $(period_to_date "$report_first") to $(period_to_date "$report_last")"
+    return 0
+}
+
+finish_report_inner() {
+    local client_config="$1"
+    local report_first="$2"
+    local report_last="$3"
+
+    sharemind-hi-client \
+        -c "$client_config" \
+        -a taskRun \
+        -- --task analytics_enclave --wait \
+        -- --finish-report
+}
+
+cancel_report_inner() {
+    local client_config="$1"
+
+    sharemind-hi-client \
+        -c "$client_config" \
+        -a taskRun \
+        -- --task analytics_enclave --wait \
+        -- --cancel true
+    report "Cancelled the current report generation!"
+}
+
+download_inner() {
+    local client_config="$1"
+    local output_dir="$2"
+    local task_instance="$3"
+
+    # Download DFC - it is in YAML format, convert it to Json.
+    #report "Querying the task instance information."
+    get_hi_dfc "$client_config" > dfc.json
+
+    <dfc.json jq '.Tasks[] | select(.Name == "analytics_enclave") | .Instances' >taskinstances.json
+    if [ "$(<taskinstances.json jq 'length')" -eq 0 ]; then
+        die "No instances exist, yet."
+    fi
+    if ! download_application_log "$client_config" "application_log.txt" "$task_instance"; then
+        die "Cannot download the application log of the required instance!"
+    fi
+    local out
+    if ! out=$(parse_application_log_to_period "application_log.txt"); then
+        die "Unexpected error while parsing the application log!"
+    fi
+    local re="([0-9]+) ([0-9]+|-1) ([0-9]+)"
+    if [[ ! $out =~ $re ]]; then
+        die "Could not find the request period range from the application log!"
+    fi
+    download_single_report "taskinstances.json" "$task_instance" "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "$output_dir"
+}
+
+poll_analytics_enclave_for_new_log() {
+    # While in the state of waiting for an NSI request, the task can be invoked with no arguments to
+    # poll whether any have been received.
+    local client_config="$1"
+
+    sharemind-hi-client \
+        -c "$client_config" \
+        -a taskRun \
+        -- --task analytics_enclave --wait
+}
+
+download_or_create_last_application_log() {
+    # Either downloads last successful instance's application log, or creates a new instance to
+    # create the first application log. Downloaded to $PWD/application_log.txt
+
+    local client_config="$1"
+    if ! download_last_application_log "$client_config" "application_log.txt"; then
+        poll_analytics_enclave_for_new_log "$client_config"
+
+        if ! download_last_application_log "$client_config" "application_log.txt"; then
+            die "Could not run the analytics_enclave!"
+        fi
+    fi
+}
+
+parse_hdata_dir_contents() {
+    # $1: directory to compile possible hdata inputs over
+    # output: due to nameref not working over full arrays, global '$out_array' is used instead
+    local hdata_dir="$1"
+    local -a matches
+    matches=()
+
+    for file in "$hdata_dir"/*.hdata; do
+        local regex="/.*?/day-([0-9]{4}-[0-9]{2}-[0-9]{2})-updates.hdata$"
+        if [[ "$file" =~ $regex ]]; then
+            local period
+            period="$(date_to_period "${BASH_REMATCH[1]}")"
+            matches+=("$period")
+        fi
+    done
+    readarray -t matches < <(printf '%s\n' "${matches[@]}" | sort -n)
+    out_array=( "${matches[@]}" )
+}
+
+############################
+# Progress Report Generation
+############################
+
+prepare_progress_report_jq() {
+    local -
+    set +x
+    # $1: instances.json file
+    # $2: Last seen valid task instance. Use -1 if this is the first invocation.
+    <"$1" jq -jr --arg inst "$2" '
+# The general output format is as follows (all fields in on line, space
+# separated, for clarity here with linebreaks, fields without values are
+# `null`):
+#   <type: poll_request, processing(_new), canceled(_new), report(_new)>
+#   <application_log_id>
+#   <latest_instance_id>
+#   <greatest_supplied_period>
+#   <old_greatest_supplied_period>
+#   <success_periods[]>                                  # colon separated
+#   <failed_periods[]>                                   # colon separated
+#   <anomalies[]: cancel_failed, poll_request_failed>    # colon separated
+#
+# Further usage:
+#   <application_log_id>: Download this app log to get the request {first} and
+#                         {last} period.
+#   <latest_instance_id>: So the script knows which one it viewed the last
+#                         time, to be supplied as $inst the next time.
+#                         Additionally, for <type=report> this is the task
+#                         instance which holds the downloadable report.
+#   <greatest_supplied_period>: To generate the progress bar: `<x%>, <k> of <n>`
+#   <old_greatest_supplied_period>: To calculate the skipped instances. If
+#                                   `null`, then the base value {from-1} must
+#                                   be taken from the application log.
+# Notes:
+#   * <poll_request>: The caller needs to check the application log whether a
+#     request was found, or if it still waiting for a new request.
+#   * <processing> with 100% is possible if the very last H file failed. Then one
+#      might add some additional information on the reporting side.
+#   * <failed_periods[]> might return values that were already reported, if some
+#     period was retried.
+#
+
+def append(x): [.[]?, x];
+def progress_already_reported: .instance <= ($inst|tonumber);
+def colon_sep_or_null: if (length > 0) then (map(tostring) | join(":")) else "null" end;
+
+# Groups the entries such that all periods that went into a final report run
+# (which has a "fingerprint_report" output, i.e. of type "report", see below)
+# are in one object, such that afterwards one can filter based on those ranges.
+# Rather similar to the `foreach` example in the man page, with a few tweaks.
+def group_batches: foreach .[] as $item (
+    {accum:{}, result:null};
+
+    ($item | progress_already_reported) as $old |
+    ($old | not) as $new |
+    ($item.failed) as $failed |
+    ($failed | not) as $success |
+
+    # Remember: this function works from newest to oldest, and wrong
+    # invocations are already filtered out (":AE01:" string)
+    if (.accum == {}) and ($old) then
+        # Do nothing - these results were already covered by earlier progress
+        # reports.
+        {accum:{}, result:null}
+
+    # Handle "canceled":
+    elif ($item.type == "cancel") and ($failed) and ($old) then
+        {
+            accum: .accum,
+            result: null
+        }
+    elif ($item.type == "cancel") and ($failed) and ($new) then
+        {
+            accum: .accum
+                | (.cancel_failed = true)
+                | (.instance //= $item.instance)
+                ,
+            result:null
+        }
+    elif ($item.type == "cancel") and ($old) then
+        { accum:{}, result:.accum }
+    elif ($item.type == "cancel") then
+        {
+            # This is a new accum object, as it finishes a report request.
+            accum: {
+                type:"canceled",
+                instance:$item.instance,
+                application_log:$item.application_log
+            },
+            result:.accum
+        }
+
+    # Handle "report" - these are guaranteed non-failures due to previous filtering.
+    elif ($item.type == "report") and ($old) then
+        { accum: {}, result: .accum }
+    elif ($item.type == "report") then
+        {
+            accum: {
+                type:"report",
+                instance:$item.instance,
+                application_log:$item.application_log
+            },
+            result: .accum
+        }
+
+    # Handle "poll_request"
+    elif ($item.type == "poll_request") then
+        {
+            accum: .accum
+            | (.type //= "poll_request")
+            # If there was some processing or report afterwards, then this direct
+            # predecessor poll request had to find a new request, otherwise one
+            # could not have progressed with processing / reporting.
+            | (if ($new) and ($success) and (.type == "processing") then .type = "processing_new" else . end)
+            | (if ($new) and ($success) and (.type == "report") then .type = "report_new" else . end)
+            | (if ($new) and ($success) and (.type == "canceled") then .type = "canceled_new" else . end)
+            | (if ($new) and ($failed) then .poll_request_failed = true else . end)
+            | (.instance //= $item.instance)
+            | (.application_log //= $item.application_log)
+            ,
+            result:null
+        }
+
+    # Handle "h". The $item.failed case is handled transparently by this one.
+    # Most importantly, it does not have .application_log set, but if it was
+    # null, then it just stays null.
+    else # ($item.type == "h") then
+        {
+            accum: .accum
+                | (.type //= "processing")
+                | (.instance //= $item.instance)
+                | (.application_log //= $item.application_log)
+                # Valid periods are ordered (otherwise ":AE01:") , and we are
+                # going newest to oldest, so the first assigned period is the
+                # greatest.
+                | (.greatest_period //= $item.period)
+                | (if ($new) and ($success) then .periods |= append($item.period) else . end)
+                | (if ($new) and ($failed) then .failed_periods |= append($item.period) else . end)
+                # Valid periods are ordered (otherwise ":AE01:") , and we are
+                # going newest to oldest, so the first assigned period is the
+                # greatest.
+                | (if ($old) then .old_greatest_period //= $item.period else . end)
+                ,
+            result:null
+        }
+    end;
+
+    if .result == null or .result == {} then empty else .result end);
+
+# Failed because it was called with invalid arguments, contains ":AE01:" string.
+def failed_due_to_invalid_arguments: (.["Error message"] // "") | test(":AE01:");
+def is_manual_report_generation_request: (.Arguments[] | select(.Key == "finish-report") | true) // false;
+def is_cancel_request: (.Arguments[] | select(.Key == "cancel") | true) // false;
+
+# THIS IS THE PIPELINE STARTING POINT
+# Id function for consistent pipelining style further down the line.
+.
+
+# These probably were not invoked by the VAD script, or it contains some race
+# condition logic error. But it means that this instance did not contain bad
+# data per se, it should be totally ignored when reporting or deciding what to
+# do next.
+| map(select(failed_due_to_invalid_arguments | not))
+
+# Additionally filter out failed manual report generations as they are expected
+# to be replaced with a future "cancel". (Note: Failed "cancel" requests are
+# treated separately, and failed H requests are somewhat expected)
+| map(select((is_manual_report_generation_request and (.Status == "Failed")) | not))
+
+# Streamline the elements such that they are more easily digestible in the
+# grouping step.
+| map({
+    instance:(.["Instance id"] | tonumber),
+    period:((.Arguments[] | select(.Key == "period") | .Value | tonumber) // null),
+    failed:(.["Status"] == "Failed"),
+    # "poll_request", "cancel", "h", "report"
+    type:(
+        # No arguments: It looks for a new NSI report request.
+        (select((.Arguments | length) == 0) | "poll_request") //
+
+        # Report processing was canceled.
+        (.Arguments[] | select(.Key == "cancel") | "cancel") //
+
+        # A report has been created, either provided by the latest period H file,
+        # or through the manual report invocation. Note: In the following pipeline
+        # step this will be normalized.
+        (.Outputs[] | select(.Topic == "fingerprint_report") | "report") //
+
+        # Some regular H file processing.
+        "h"),
+    application_log:((.Outputs[] | select(.Topic == "application_log") | .Id) // null),
+})
+
+# Normalize fingerprint reports that were generated upon the last H file into an
+# "h" record and a "report" record. Note: this "report" is also not "Failed",
+# because it was identified as a "report" through the "fingerprint_report" output
+# in the first place, which is only generated for "Finished" instances.
+| map(if (.period != null) and (.type == "report") then (.type = "h"), (.period = null) else . end)
+
+# Reverse the results so we work through the interesting parts.
+| reverse
+
+# Append a dummy "cancel" which serves as mark to flush the last group in the
+# following grouping. (Not sure if this would be more efficient to prepend before
+# reversing, but conceptually it fits better close to the grouping call.)
+| append({type: "cancel", instance: -1, failed: false})
+
+# Group the runs together which are part of the same report request processing
+# (and remove canceled runs).
+| group_batches
+
+# Print the results: Two numbers per line, easily digestible with a bash
+#   `while read -r app_log_id instance_id; do; ... done;`
+# loop
+| (
+    .type,
+    " ",
+    .application_log,
+    " ",
+    .instance,
+    " ",
+    .greatest_period,
+    " ",
+    .old_greatest_period,
+    " ",
+    (.periods|colon_sep_or_null),
+    " ",
+    (.failed_periods|colon_sep_or_null),
+    " ",
+    ([
+        (if .cancel_failed then "cancel_failed" else empty end),
+        (if .poll_request_failed then "poll_request_failed" else empty end)
+    ]|colon_sep_or_null),
+    "\n")' #' <- keep this quote. vim bash syntax highlighting gets confused
+           #     somehow by this long quote and thinks the actually closing one
+           #     is an opening one, and the commented quote closes it.
+}
+
+write_periods() {
+    # $1: out file
+    # $2: Descriptive prefix (e.g. "Failed dates:", "Skipped dates:")
+    # $3: colon separated elements, or "null"
+    #
+    # Does not write anything if there are no elements or "null".
+
+    if [ -z "$3" ] || [ "$3" = "null" ]; then
+        return 0
+    fi
+
+    local period
+    local first=true
+    local -a MAPFILE
+    mapfile -d ":" -t < <(printf "%s" "$3")
+    {
+        printf "%s" "$2";
+        for period in "${MAPFILE[@]}"; do
+            if ! $first; then
+                printf ","
+            fi
+            printf " %s" "$(period_to_date "$period")";
+            first=false
+        done;
+        printf "\n";
+    } >> "$1"
+}
+
+write_success_periods() {
+    # $1: out file
+    # $2: colon separated successful periods
+    #
+    # Does not write anything if there are no failed periods (or "null").
+    write_periods "$1" "Successful dates:" "$2"
+}
+
+write_failed_periods() {
+    # $1: out file
+    # $2: colon separated failed periods
+    #
+    # Does not write anything if there are no failed periods (or "null").
+    write_periods "$1" "Failed dates:" "$2"
+}
+
+write_skipped_periods() {
+    # $1: out file
+    # $2: colon separated success periods
+    # $3: colon separated failed periods
+    # $4: greatest period - shall not be null if `$8 = partial`! 
+    # $5: old greatest period
+    # $6: {from} from application log
+    # $7: {to} from application log
+    # $8: "finished" | "partial"
+    #
+    # Does not write anything if there are no failed periods (or "null").
+    # 
+
+    local -a successes
+    local -a failures
+    mapfile -d ":" -t successes < <(printf "%s" "$2")
+    mapfile -d ":" -t failures < <(printf "%s" "$3")
+
+    if [ "$5" = null ]; then
+        local from="$6" # {from} from application log
+    else
+        local from="$(( ${5} + 1 ))" # old successful period
+    fi
+
+    if [ "$8" = "finished" ]; then
+        local to="$7" # {to} from application log
+    else
+        local to="$4"
+    fi
+
+    local -a skipped_array
+    mapfile -t skipped_array < <(
+        # https://stackoverflow.com/a/13038235/2140959
+        sort \
+            <(seq "$from" "$to") \
+            <(printf "%s\n" "${successes[@]}" "${failures[@]}") \
+            <(printf "%s\n" "${successes[@]}" "${failures[@]}") \
+            | uniq -u
+    )
+
+    local skipped
+    skipped="$(IFS=":"; echo "${skipped_array[*]}")"
+    write_periods "$1" "Skipped dates:" "$skipped"
+}
+
+write_anomalies() {
+    # $1: out file
+    # $2: colon separated anomalies
+    #
+    # Does not write anything if there are no anomalies (or "null").
+    if [ -z "$2" ] || [ "$2" = "null" ]; then
+        return 0
+    fi
+
+    # Splitting in the `write_periods` function is done based on ":", not " ".
+    anomalies="${anomalies//cancel_failed/Failed to cancel a report;}"
+    anomalies="${anomalies//poll_request_failed/Failed to poll a new request;}"
+    anomalies="${anomalies//:/ }"
+    printf "Anomalies: %s\n" "$anomalies" >> "$1"
+}
+
+write_period_information() {
+    # $1: out file
+    # $2: colon separated success periods
+    # $3: colon separated failed periods
+    # $4: greatest period - shall not be null if `$8 = partial`! 
+    # $5: old greatest period
+    # $6: {from} from application log
+    # $7: {to} from application log
+    # $8: "finished" | "partial"
+    # ^ up to this point equal to "write_skipped_periods", so forwards as "$@"
+    # $9: anomalies
+
+    write_success_periods "$1" "$2"
+    write_failed_periods "$1" "$3"
+    write_skipped_periods "$@"
+    write_anomalies "$1" "$9"
+    printf "\n" >>"$1"
+}
+
+maybe_download_application_log_for_period_ranges() {
+    # $1: data-id in application log topic
+    # Implicit:
+    #   * $client_config
+    # Out variables: Assigns to variables which should then be visible in the calling scope.
+    #   * period_first
+    #   * period_last
+
+    # The default values instead there are no new period range values.
+    period_first="-1"
+    period_last="-1"
+
+    if [ "$1" = "null" ]; then
+        return 0
+    fi
+
+    report "Downloading application_log <$1> to lookup the period range."
+    sharemind-hi-client \
+        -c "$client_config" \
+        -a dataDownload \
+        -- \
+        --topic "application_log" \
+        --dataid "$1" \
+        --datafile application_log || die "Failed to download the application log"
+    if [[ "$(<application_log)" =~ First\ period:\ ([0-9]+).*last\ period:\ ([0-9]+) ]]; then
+        period_first="${BASH_REMATCH[1]}"
+        period_last="${BASH_REMATCH[2]}"
+    else
+        # This happens when the enclave looks for new report requests. It maybe
+        # finds something, maybe not. In this case it did not find a new valid
+        # request. The default values "-1" were already assigned in the
+        # beginning, so nothing to do here.
+        :
+    fi
+}
+
+prepare_progress_report() {
+    local -
+    set +x
+    # $1: Out file where to write the progress report
+    # $2: Where to write the new latest instance - this should not be the true
+    #     state file, yet. Only write there after the progress report has been
+    #     sent out successfully.
+    # $3: out file were to write the "$finished_task_instance $from $to" lines
+    #     to download the finished reports.
+    # $4: instances.json file
+    # $5: Last seen valid task instance. Use -1 if this is the first invocation.
+    #
+    # Report: `x%`, `k/n done`, `skipped: a, b, c`, `failed: a, b, c`
+    # No need to report on successful instances - if all is going well, then
+    # the ideal report just names concisely `x%, k/n done`.
+    #
+    #   # When a report was finished, an existing one or a new one.
+    #   Finished a (new )report {from} - {to}
+    #   Successful dates: x, y, z
+    #   Failed dates: a, b, c
+    #   Skipped dates: e, f, g
+    #
+    #   # When no instances have been supplied, yet, but detected that something new is there.
+    #   Accepted a new report {from} - {to}
+    #
+    #   # Processing a new report, instead of "Accepted", because something was supplied already.
+    #   Processing a (new )report {from} - {to}: x% done, k of n
+    #   Successful dates: x, y, z
+    #   Failed dates: a, b, c
+    #   Skipped dates: e, f, g
+    #
+    #   # When a report was canceled
+    #   Canceled a (new )report {from} - {to}
+    #   Successful dates: x, y, z
+    #   Failed dates: a, b, c
+    #   Skipped dates: e, f, g
+
+    # Make sure the report file will only exist if there is something to report.
+    rm -f "$1"
+    # This file should exist.
+    : > "$3"
+
+    local period_first="-1"
+    local period_last="-1"
+    local new_latest_instance=""
+
+    # Created by the `read` call.
+    local type
+    local application_log
+    local latest_instance
+    local greatest_period
+    local old_greatest_period
+    local success_periods
+    local failed_periods
+    local anomalies
+
+    local date_first date_last
+
+    while read -r \
+        type \
+        application_log \
+        latest_instance \
+        greatest_period \
+        old_greatest_period \
+        success_periods \
+        failed_periods \
+        anomalies; do
+
+        # Sets $period_first and $period_last. If no range could be extracted,
+        # the values "-1" are assigned instead.
+        maybe_download_application_log_for_period_ranges "$application_log"
+
+        # This does not fail for the "-1" default values (date before
+        # 1970-01-01), but in that case the converted dates are also ignored.
+        date_first="$(period_to_date "$period_first")"
+        date_last="$(period_to_date "$period_last")"
+        if [ -z "$new_latest_instance" ]; then
+            new_latest_instance="$latest_instance"
+        fi
+
+        case "$type" in
+            *_new)
+                local new_space="new "
+                ;;
+            *)
+                local new_space=""
+                ;;
+        esac
+
+        case "$type" in
+            poll_request)
+                if [ "$period_first" -gt -1 ]; then
+                    printf "Accepted a new report %s to %s\n" "$date_first" "$date_last" >>"$1"
+                    printf "\n" >>"$1"
+                else
+                    # No new request was found. This message would be rather
+                    # annoying if repeated calls don't find a new request.
+                    # Instead, the rule is to only report if something new
+                    # happened.
+                    :
+                fi
+                ;;
+            processing|processing_new)
+                # Assert: $greatest_period != null: At least some new instance
+                # failed, otherwise the :AE01: invalid instances are filtered
+                # out and no progress report should be created at all.
+                # Assert: "$period_first" and "$period_last" are valid: A
+                # report can only be worked on if it was accepted first.
+                local percent
+                local total="$((period_last - period_first + 1))"
+                local done="$((greatest_period - period_first + 1))"
+                percent="$(perl -e "printf(q(%.2f), (100 * $done) / $total)")"
+                # Note: if `$done == $total`, then the last one must be a
+                # failure, as otherwise it would be of type "report". Now, the
+                # VAD script can either decide to try to manually rerun the
+                # task, or cancel it.
+                printf "Processing a ${new_space}report %s to %s, %s%% done, %s out of %s\n" \
+                    "$date_first" \
+                    "$date_last" \
+                    "$percent" \
+                    "$done" \
+                    "$total" \
+                    >>"$1"
+                write_period_information \
+                    "$1" \
+                    "$success_periods" \
+                    "$failed_periods" \
+                    "$greatest_period" \
+                    "$old_greatest_period" \
+                    "$period_first" \
+                    "$period_last" \
+                    "partial" \
+                    "$anomalies"
+                ;;
+            canceled|canceled_new)
+                # Assert: "$period_first" and "$period_last" are valid: A
+                # report can only be called if it was accepted first.
+                printf "Canceled a ${new_space}report %s to %s\n" "$date_first" "$date_last" >>"$1"
+                write_period_information \
+                    "$1" \
+                    "$success_periods" \
+                    "$failed_periods" \
+                    "$greatest_period" \
+                    "$old_greatest_period" \
+                    "$period_first" \
+                    "$period_last" \
+                    "finished" \
+                    "$anomalies"
+                ;;
+            report|report_new)
+                # Assert: "$period_first" and "$period_last" are valid: A
+                # report can only be finished if it was accepted first.
+                printf "Finished a ${new_space}report %s to %s\n" "$date_first" "$date_last" >>"$1"
+                write_period_information \
+                    "$1" \
+                    "$success_periods" \
+                    "$failed_periods" \
+                    "$greatest_period" \
+                    "$old_greatest_period" \
+                    "$period_first" \
+                    "$period_last" \
+                    "finished" \
+                    "$anomalies"
+
+                # Store the information from where to download the report data,
+                # and what name it is.
+                printf "%s %s %s\n" \
+                    "$latest_instance" "$period_first" "$period_last" \
+                    >>"$3"
+                ;;
+        esac
+    done < <(prepare_progress_report_jq "$4" "$5")
+
+    if [ -n "$new_latest_instance" ]; then
+        echo "$new_latest_instance" > "$2"
+    else
+        # Make sure the file only exists if there is a new instance id.
+        rm -f "$2"
+    fi
+}
+
+compile_progress_report() {
+    local client_config="$1"
+    local output_dir="$2"
+    local progress_callback="$3"
+
+    # The script stores which task instance was available the last time in "$state_file".
+
+    local state_dir="$output_dir/sharemind-hi-vad-state"
+    mkdir -p "$state_dir"
+    local state_file="$state_dir/next-instance"
+
+    local last_seen_instance=-1
+    if [ -s "$state_file" ]; then
+        # The state file exists and has content, load it.
+        last_seen_instance="$(<"$state_file")"
+        if ! [[ "$last_seen_instance" =~ ^[0-9]+$ ]]; then
+            # .. but it contains garbage data (expected a single number) so
+            # ignore it.
+            last_seen_instance=-1
+        fi
+    fi
+
+    # Download DFC - it is in YAML format, convert it to Json.
+    report "Querying the task instance information."
+    get_hi_dfc "$client_config" > dfc.json
+
+    <dfc.json jq '.Tasks[] | select(.Name == "analytics_enclave") | .Instances' >taskinstances.json
+    if [ "$(<taskinstances.json jq 'length')" -eq 0 ]; then
+        # No instances exist, yet.
+        return 0
+    fi
+
+    local progress_report_file="progress_report_file"
+    local new_state_file="new_state_file"
+    local report_output_id_file="report_output_id_file"
+
+    prepare_progress_report \
+        "$progress_report_file" \
+        "$new_state_file" \
+        "$report_output_id_file" \
+        taskinstances.json \
+        "$last_seen_instance"
+
+    set +e
+    while read -r instance_id period_first period_last; do
+        (set -e; download_single_report \
+            taskinstances.json \
+            "$instance_id" \
+            "$period_first" \
+            "$period_last" \
+            "$output_dir")
+        # Putting the above into the if expression nullifies the effect of `set
+        # -e` that failing intermediate programs automatically fail the
+        # subshell. See http://mywiki.wooledge.org/BashFAQ/105 including the
+        # exercises. Hence also disable the shellcheck lint for this one
+        # occasion.
+        # shellcheck disable=SC2181
+        if [ "$?" -ne 0 ]; then
+            # Also print the instance id so one can try to download the data
+            # manually later.
+            printf "Failed to download report %s-%s from analytics enclave task instance id %s\n" \
+                "$(period_to_date "$period_first")" \
+                "$(period_to_date "$period_last")" \
+                "$instance_id" \
+                >>"$progress_report_file"
+        fi
+    done <"$report_output_id_file";
+    set -e
+
+    if [ -s "$progress_report_file" ]; then
+        # Some progress happened, so we can report it.
+        if "$progress_callback" "$progress_report_file"; then
+            # Reporting was successful, so commit the instance id from which on
+            # a new progress report should be generated the next time.
+            cp "$new_state_file" "$state_file"
+        fi
+    fi
+}
+
+last_instance_is_failed_report_generation() {
+    # $1: instances.json file
+    # $2: period_last of current report request, or -1
+
+    local -
+    set +x
+
+    if [ "$2" -eq -1 ]; then
+        return 1
+    fi
+    local true_or_false
+    true_or_false="$(<"$1" jq -jr --arg period_last "$2" '
+def failed_due_to_invalid_arguments: (.["Error message"] // "") | test(":AE01:");
+
+map(select(failed_due_to_invalid_arguments | not))
+| .[-1]
+| (
+        (.Status == "Failed")
+    and ((.Arguments | length) > 0) # not looking for a new report request
+    and (
+           (.Arguments[0].Key == "fingerprint_report")
+        or (
+                 (.Arguments[0].Key != "cancel") # has the period
+             and ((.Arguments[] | select(.Key == "period") | (.Value | tonumber) == ($period_last | tonumber)) // false)
+           )
+        )
+  )
+  ')"
+  "$true_or_false"
+}
+
+last_instance_finished_or_canceled_a_report() {
+    # $1: instances.json file
+
+    local -
+    set +x
+
+    local true_or_false
+    true_or_false="$(<"$1" jq -jr '
+def failed_due_to_invalid_arguments: (.["Error message"] // "") | test(":AE01:");
+
+map(select(failed_due_to_invalid_arguments | not))
+| .[-1]
+| (
+        # Only interested in success - important for "cancel" as this might
+        # have failed, e.g. due to power transition event which kills SGX
+        # enclaves.
+        (.Status == "Finished")
+    and ((.Arguments | length) > 0)
+    and (
+           ((.Outputs[] | select(.Topic == "fingerprint_report") | true) // false)
+        or (.Arguments[0].Key == "cancel")
+        )
+  )
+  ')"
+  "$true_or_false"
+}
+
+automatic_h_file_import() {
+    parse_scalar client_config "-s|--sharemind-client-config" realpath
+    parse_scalar import_dir "-i|--h-file-import-dir" realpath
+    parse_scalar old_file_behaviour "-b|--old-h-files" verbatim
+    parse_scalar output_dir "-o|--output-dir" realpath
+    parse_scalar progress_callback_command "-c|--progress-callback" executable
+
+    if ! [[ "$old_file_behaviour" == "delete" || "$old_file_behaviour" == "keep" ]]; then
+        die "Unexpected value provided for argument '--old-h-csv-files'!"
+    fi
+
+    pushd "$working_directory"
+
+    local allow_rechecking_report_availability=true
+
+    while true; do
+        compile_progress_report "$client_config" "$output_dir" "$progress_callback_command"
+
+        assert_no_pending "$client_config"
+
+        download_or_create_last_application_log "$client_config"
+
+        # Determine if a report is currently being processed using the
+        # following steps:
+        #  * Check if the last instance finished / canceled a report.
+        #  * Check if the application log contains a report range
+        #    -> Finds "waiting for a report".
+        #  * Check if the last instance was a failed report generation
+        local out
+        out=$(parse_application_log_to_period "application_log.txt")
+        local re="([0-9]+) ([0-9]+|-1) ([0-9]+)"
+        if last_instance_finished_or_canceled_a_report "taskinstances.json" || [[ ! $out =~ $re ]]; then
+            # Application log parser returned unparsable things, this
+            # means no report is currently being processed.
+
+            if "$allow_rechecking_report_availability"; then
+                report "Polling the analytical task for new NSI requests"
+                poll_analytics_enclave_for_new_log "$client_config"
+                allow_rechecking_report_availability=false
+                continue
+            fi
+
+            finish "No new NSI request found, exiting..."
+        fi
+        local report_first="${BASH_REMATCH[1]}"
+        local expected_next="${BASH_REMATCH[2]}"
+        local report_last="${BASH_REMATCH[3]}"
+        if [[ "$expected_next" == "-1" ]]; then
+            expected_next="$report_first"
+        fi
+
+        # Reset it, as we found something.
+        allow_rechecking_report_availability=true
+
+        if [[ "$expected_next" -gt "$report_last" ]]; then
+            # If the application log contains the last as expected input,
+            # it will have successfully completed the report.
+
+            # Reporting and downloading of the report is handled by the
+            # progress report function.
+
+            poll_analytics_enclave_for_new_log "$client_config"
+            allow_rechecking_report_availability=false
+            continue # lets recheck that
+        fi
+
+        if last_instance_is_failed_report_generation "taskinstances.json" "$report_last"; then
+            # If the report generation failed, then the state is probably broken
+            # and could not be fixed by putting even more H files into it. Hence
+            # cancel it and continue.
+            finish_or_cancel_report "$client_config" "$report_first" "$report_last"
+            poll_analytics_enclave_for_new_log "$client_config"
+            allow_rechecking_report_availability=false
+            continue # lets recheck that
+        fi
+
+        # The current "$expected_next" contains the value from the last
+        # successful instance, but we need to overwrite it if the actual last
+        # instance was a failed
+        if ! out=$(get_last_period_and_status "$client_config"); then
+            # Last execution of the analytical enclave failed, thus we need to
+            # skip the last input.
+
+            # TODO is "$out" always a number, or could is be empty here?
+            # Assert: `out + 1 >= expected_next` as otherwise the instance
+            # failed with the error ":AE01:" and was filtered away by the
+            # `get_last_period_and_status` function (TODO does this happen?).
+            expected_next="$((out+1))"
+        fi
+
+        local -a hdata_periods_array
+
+        parse_hdata_dir_contents "$import_dir"
+        hdata_periods_array=( "${out_array[@]}" )
+
+        # Checking for existance of hdata periods exceeding the report's range.
+        # This info will be used to later force an report creation, due-to the missing data.
+        local max
+        max="$(printf "%s\n" "${hdata_periods_array[@]}" -1 | grep . | sort -n | tail -n1)"
+
+        # Compute the set intersection of available periods and remaining periods.
+        local current_h_file_list
+        readarray -t current_h_file_list < <(
+            comm -12 \
+                <(printf "%s\n" "${hdata_periods_array[@]}" | sort) \
+                <(seq "$expected_next" "$report_last" | sort) | sort -n
+        )
+
+        if [ "${#current_h_file_list[@]}" -eq 0 ]; then
+            if [ "$max" -le "$report_last" ]; then
+                finish "No H files for current analysis found, exiting..."
+            fi
+
+            report "No periods for analysis within this report found, but closing the report due to existance of newer data."
+
+            finish_or_cancel_report "$client_config" "$report_first" "$report_last"
+
+            # The rest of the loop handles H file uploads, of which no suitable
+            # were found.
+            continue
+        fi
+
+        # Go through the available H files which are part of the report request
+        # and supply them all. If we are done, the next iteration will decide
+        # whether to exit / wait for new H files, or finish it and continue
+        # processing.
+        local period date
+        for period in "${current_h_file_list[@]}"; do
+            date=$(period_to_date "$period")
+
+            local hdata="$import_dir/day-$date-updates.hdata"
+
+            # Prepare the meta file which is read implicitly by the task
+            # enclave by appending ".meta" to the h filename.
+            # If it already exists, its content should not be overwritten but
+            # the `stat` information simply appended.
+            stat "$hdata" >> "$hdata.meta"
+
+            report "Scheduling the analytics enclave for date $date."
+            # Ignore output errors, script will adapt in the next iteration if the invocation failed.
+            sharemind-hi-client \
+                -c "$client_config" \
+                -a taskRun \
+                -- --task analytics_enclave \
+                   --wait \
+                -- --period "$period" \
+                   --file "$hdata" || true
+            compile_progress_report "$client_config" "$output_dir" "$progress_callback_command"
+
+            if [[ "$old_file_behaviour" == "delete" ]]; then
+                rm -f "$hdata" "$hdata.meta"
+            fi
+        done
+    done
+
+    popd
+
+}
+
+finish_report() {
+    parse_scalar client_config "-s|--sharemind-client-config" realpath
+    parse_scalar output_dir "-o|--output-dir" realpath
+    parse_scalar progress_callback_command "-c|--progress-callback" realpath
+
+    compile_progress_report "$client_config" "$output_dir" "$progress_callback_command"
+
+    # TODO: properly flesh out the error cases
+    if ! download_last_application_log "$client_config" "application_log.txt"; then
+        die "The analytical task has not been successfully run yet!"
+    fi
+
+    local out
+    if ! out=$(parse_application_log_to_period "application_log.txt"); then
+        # Error while parsing log, or simply no available request.
+        # In any case, no analysis can be performed.
+        finish "Could not find any request to import for, possibly no request yet available."
+    fi
+    local re="([0-9]+) ([0-9]+|-1) ([0-9]+)"
+    if [[ ! $out =~ $re ]]; then
+        # Application log parser returned unparsable things, ought not happen.
+        finish "No NSI request found, exiting..."
+    fi
+
+    # taskinstances.json created by `download_last_application_log`
+    if last_instance_is_failed_report_generation "taskinstances.json" "${BASH_REMATCH[3]}"; then
+        report "Last report generation failed, cannot finish report, cancelling it instead."
+        cancel_report_inner "$client_config"
+        compile_progress_report "$client_config" "$output_dir" "$progress_callback_command"
+        exit 0
+    fi
+
+    if ! finish_or_cancel_report_inner "$client_config" "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}"; then
+        #report "The generation of the requested report failed, the report will be cancelled instead."
+        compile_progress_report "$client_config" "$output_dir" "$progress_callback_command"
+        exit 0
+    fi
+    download_inner "$client_config" "$output_dir" "-1"
+}
+
+LOCKFILE=/run/lock/sharemind-hi-vad-wrapper.lock
+
+touch "$LOCKFILE"
+
+exec {FD}<>"$LOCKFILE"
+
+if ! flock -x -w 0 $FD; then
+    die "Instance already running!"
+fi
+
+case "$action" in
+    automatic-h-file-import)
+        automatic_h_file_import
+        ;;
+    finish-report)
+        finish_report
+        ;;
+    *)
+        help_and_die "Unknown action <$action> requested."
+        ;;
+esac
+
+exit 0

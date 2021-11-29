@@ -1,0 +1,97 @@
+= Data Flow =
+
+This document gives an overview over the usage of the flow of data in this enclave, using the HI Stream API.
+
+
+-> (read H) READ(H)
+-> (smap H depseudonymize)
+-> (sort H) WRITE(H) + READ(H)
+-> (filter H)
+-> (group H)
+-> (flatMap H)
+
+outerJoin(H, read S) READ(S)
+-> (smap HS -> S)
+-> (write S) WRITE(S)
+
+// quantise
+-> (read S) READ(S)
+-> (group S)
+-> (flatMap S)
+-> (write Y) WRITE(Y)
+
+// add_reference_areas
+-> (read Y) READ(Y)
+-> (groupBy Y)
+-> (flatMap Y)
+-> (write Y_a) WRITE(Y_a)
+
+// calculate_top_anchor_dist
+-> (read Y) READ(Y) (no sorting required)
+-> (foreach Y) RESULT(top_anchor_dist)
+
+// add_calibration_weights
+-> (read Y) READ(Y)
+-> (smap Y) USE(top_anchor_dist) -> DEPENDS ON calculate_top_anchor_dist
+-> (write Y_w) WRITE(Y_w)
+
+// sdc_filter_top_anchor_dist
+USE(top_anchor_dist)
+
+// sum_footprints DEPENDS ON add_calibration_weights
+-> (read Y_w) READ(Y_w)
+-> (sort Y_w) WRITE(Y_ws) READ(Y_ws)
+-> (groupBy Y_ws)
+-> (flatMap Y_ws)
+-> (write T) WRITE(T)
+
+// total_footprint_sdc
+-> (read T) READ(T)
+-> (smap T)
+-> (write T) WRITE(T) to topic
+
+// connection_strength depends on add_reference_areas, add_calibration_weights
+-> (read Y_a_w) READ(Y_a_w)
+-> (foreach Y_a_w)
+
+READ(H): 2
+WRITE(H): 1
+READ(S): 2
+WRITE(S): 1
+WRITE(Y): 4
+READ(Y): 6
+
+ingest
+-> (read H) READ(H)
+-> (sort H) WRITE(H) + READ(H)
+outerJoin(H, read S) READ(S)
+-> (smap HS -> S)
+-> TEE (write S) WRITE(S) (background, not costing too much)
+MERGE quantise (S -> Y)
+MERGE add_reference_areas (Y -> Y_a)
+INSPECT (calculate_top_anchor_dist Y order irrelevant) RESULT(top_anchor_dist)
+-> (write Y_a) WRITE(Y_a) // let top_anchor_dist be built. Probably no way around
+
+// add_calibration_weights
+-> (read Y_a) READ(Y_a)
+-> (smap Y_a->Y_a_w) USE(top_anchor_dist) -> DEPENDS ON calculate_top_anchor_dist
+INSPECT (connection_strength)
+// MERGE sum_footprints start -> (write Y_a_w) WRITE(Y_a_w)
+// -> (read Y_a_w) READ(Y_a_w)
+-> (sort Y_a_w) WRITE(Y_ws) READ(Y_ws)
+-> (groupBy Y_ws)
+-> (flatMap Y_ws -> T)
+// MERGE total_footprint_sdc -> (write T) WRITE(T)
+// -> (read T) READ(T)
+-> (smap T)
+-> (write T) WRITE(T) to topic
+
+// sdc_filter_top_anchor_dist
+USE(top_anchor_dist)
+
+READ(H): 2
+WRITE(H): 1
+READ(S): 1
+WRITE(S): 1
+WRITE(Y): 2
+READ(Y): 2

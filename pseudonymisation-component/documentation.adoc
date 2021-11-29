@@ -1,0 +1,261 @@
+= [ESTAT 2019.0232] User Guide For MNO-ND
+:pdf-style: cyber-theme.yml
+:revdate: 29.07.2021
+:revnumber: 1.2
+:docnumber: Y-1440-8
+:author: Document ID: {docnumber}
+:source-highlighter: rouge
+:toc:
+:toclevels: 5
+:numbered:
+:sectnumlevels: 5
+:imagesdir: images
+:icons: font
+:classification: Confidential
+:title-page:
+:title-page-background-image: {pdf-stylesdir}/images/title_page_bg_Confidential.svg
+:shi: Sharemind HI
+:proj: ESTAT 2019.0232
+:archdoc: {proj} Solution architecture
+:xrefstyle: full
+:mrsigner: b6526334ec61a3a71aea09b5b8df171c3b369f877beb2a23a047d595e9f0524b
+:cemrenclave: c15b08a14b7ddc6a47a07952e54722721a780e5a0eb9cee6293390011661a913
+:aemrenclave: c8e9ea552d6754911c65f68819e528ad08dae2c9ace5604859d5431e3b644b64
+:kemrenclave: ea02204d30c66fa5123c1d9deaeeecb31b11b84c1838954f0095c89f91e5a767
+:eaemrenclave: 5eb0b5d53e90637762e132004df0735b692f99fee064fc7b622cdff9696d2957
+:epkemrenclave: 1abc7030d015a376cc0d7427700ca76d35bc243eb06c6332eee1e75f17c2f09b
+
+== Installation of the Sharemind HI Modules for MNO-ND
+
+=== Overview
+
+The ESTAT 2019.0232 project is a collaboration between Cybernetica and Eurostat
+to develop a proof-of-concept solution for passive mobile positioning data
+analysis which preserves the privacy rights of the data subjects.
+State-of-the-art trusted execution environment technology and pseudonymisation
+are applied in the solution to ensure privacy by design in calculations and
+output.
+
+The project scenario involves a mobile network operator (MNO) and national
+statistics institute (NSI). The NSI uses the project solution to compute
+longitudinal analysis over a longer period by combining the location data of MNO
+subscribers with confidential auxilary data from the NSI.
+
+The project approach honours the principles of data minimisation,
+privacy-by-design and purpose specification that lie at the foundation of the
+General Data Protection Regulation (“GDPR”) of the European Union.
+
+=== Document Scope
+
+This manual describes how the MNO-ND department can install and use the Sharemind HI modules of the {proj} project.
+
+The full list of delivery documents:
+
+ * Solution Analysis
+ * Solution Architecture
+ * DPIA Evaluation Report
+ * User Guide for NSI
+ * User Guide for MNO-VAD
+ * User Guide for Auditors
+ * User Guide for MNO-ND
+ * Sharemind HI Documentation
+ * Sharemind HI ToS
+ * Sharemind HI License
+ * Synthetic Test Data Generation
+
+
+=== Introduction
+
+Throughout this guide you will go through the following high-level steps (not necessarily to be performed in the presented order):
+
+* Evaluate the suitability of your machine for the software modules
+* Configure access to the Sharemind APT repository and install the required packages
+//* #create a private key and public certificate, to be signed by the Coordinator#
+//* #exchange certificates with other stakeholders#
+* Configure the {shi} Client (enclave fingerprints, trusted Enforcers, ...)
+* Learn how to approve the dataflow configuration in the {shi} Server
+* Configure the pseudonymisation component
+* Learn how to use the pseudonymisation component to pseudonymise IMSIs
+
+Please note that this guide is accompanied by additional, generic {shi} Installation documents which are referenced throughout this document.
+
+If you are uncertain about how to obtain all prerequisites please contact the coordinator of the project.
+
+For any communication regarding the Solution and its different parameters, such as certificates or enclave fingerprints, we advise using authenticated communication channels (e.g. PGP, other PKI systems, or delivering documents/data in person), which thwarts any attempts of third-party message tampering. 
+
+=== Requirements
+
+The delivered Sharemind HI modules are designed to work with Ubuntu 20.04.
+They may not work on other operating systems and Linux distributions.
+The standard Ubuntu recommended system requirementsfootnote:[https://help.ubuntu.com/community/Installation/SystemRequirements] cover the resource requirements for the Sharemind HI modules for MNO-ND.
+
+=== Installation
+==== Prerequisites
+
+* Credentials for APT repository: username and password
+
+[#installation-command-invocation]
+==== Command Invocation
+
+* Complete the instructions from the _{shi} Client Installation Guide_ with given APT credentials
+* In addition to the mentioned packages in the installation guide, install sharemind-hi-nd:
+
+[source,bash]
+[%autofit]
+----
+sudo apt install sharemind-hi-nd
+----
+
+[#configuring-pseudonymisation-component]
+==== Configuring the pseudonymisation component
+
+The pseudonymisation component can be started using the `sharemind-hi-nd` command. It expects that the following environment variables have been defined:
+
+* `PSEUDONYMISATION_COMPONENT_PERIODIC_KEY_PATH` - path to a directory where a periodic pseudonymisation key will be temporarily stored after retrieving it from the pseudonymisation key enclave and before the pseudonymisation component reads the key into memory
+* `PSEUDONYMISATION_COMPONENT_HI_CLIENT_CONFIGURATION` - path to the Sharemind HI client configuration created when following the _Sharemind HI Client Installation Guide_ (<<installation-command-invocation>>)
+
+You can either define the environment variables before executing `sharemind-hi-nd`:
+
+```sh
+export PSEUDONYMISATION_COMPONENT_PERIODIC_KEY_PATH=/path/to/keys/directory
+export PSEUDONYMISATION_COMPONENT_HI_CLIENT_CONFIGURATION=/path/to/client.yaml
+```
+
+or create a `.env` file in the working directory where you will execute `sharemind-hi-nd` with the following format:
+
+```sh
+PSEUDONYMISATION_COMPONENT_PERIODIC_KEY_PATH=/path/to/keys/directory
+PSEUDONYMISATION_COMPONENT_HI_CLIENT_CONFIGURATION=/path/to/client.yaml
+```
+
+You can also define `PSEUDONYMISATION_COMPONENT_ADDRESS` with the format `127.0.0.1:port`. Do not change the host to anything other than 127.0.0.1 and do not open the port that you are using for the pseudonymisation component. The default port is 5000.
+
+== Usage of Sharemind HI
+
+After completing the installation described in the previous section, and when the {shi} server is started by MNO-VAD, the following actions are expected to be executed by the MNO-ND department.
+
+* Approving the Solution (once) – <<once-approving, Section 2.1>>
+* Pseudonymising IMSIs in MNO-ND data (recurring) – <<recurring-pseudonymising, Section 2.2>>
+//* #Transmitting pseudonymised data to MNO-VAD (recurring)#
+
+[#once-approving]
+=== Once: Approving the Dataflow Configuration
+
+The MNO-ND department is an Enforcer and needs to approve the dataflow configuration in the {shi} server once to enable the secure computation.
+This process is interactive and requires the operator to scrutinize the displayed dataflow configuration, as any inconsistency might be a sign of a data exfiltration attempt.
+
+==== Prerequisites
+
+* The X.509 certificates of the other stakeholders
+* The fingerprint values of the task enclaves received from the auditor
+
+==== Command Invocation
+
+The interactive approval command can be invoked as follows:
+
+[source,bash]
+[%autofit]
+----
+sharemind-hi-client -c "/path/to/client.yaml" -a dfcApprove
+----
+
+This will print the active dataflow configuration which needs to be validated manually by the operator.
+The operator needs to be especially vigilant with the following points:
+
+* Are the stakeholder certificates correct? A SHA-256 digest of the DER encoding of each X.509 certificate is given which should be verified. The digest from a certificate can be calculated as follows: +
+`openssl x509 -in stakeholder.crt -outform der | openssl dgst`
+* Are the stakeholders assigned to the correct roles?
+* Are the task enclave fingerprints correct? A list of all enclave fingerprints is given in the end of the document.
+
+If the operator finds the displayed dataflow configuration to be valid, they shall type  `Y` and `Enter` key to express the approval.
+The cryptographic approval is stored in the {shi} server.
+
+After giving their approval the operator can proceed with next steps only when the other Enforcers have also given their approval.
+The approval status can be checked with the following command, an explanation of the output follows:
+
+[source,bash]
+[%autofit]
+----
+sharemind-hi-client -c "/path/to/client.yaml" -a displayDfc
+----
+
+Within the output, the `Approvals` section lists which Enforcers gave their approvals, as can be seen in the following exemplary output listing VAD and NSI:
+
+[source,yaml]
+[%autofit]
+----
+...
+Approvals:
+  - Enforcer: VAD
+    Signature: ...
+  - Enforcer: NSI
+    Signature: ...
+...
+----
+
+[#recurring-pseudonymising]
+=== Recurring: Pseudonymising IMSIs
+
+IMSIs can be pseudonymised by communicating with the pseudonymisation component
+using its REST API.
+
+==== Prerequisites
+
+* The approval has been given, as described in chapter <<once-approving>>
+* The pseudonymisation component has been installed and configured as described in <<installation-command-invocation>> and <<configuring-pseudonymisation-component>>
+* The pseudonymisation component is running
+
+==== Making requests to the pseudonymisation component
+
+The REST API of the pseudonymisation component is described in the _{archdoc}_ document Section 3.4. The software that requires pseudonymisation functionality shall make requests to the address configured in <<configuring-pseudonymisation-component>> using the API described in the _{archdoc}_ document.
+
+== Enclave Fingerprints
+
+=== For the Regular {shi} Operation
+
+The fingerprint values of the {shi} management enclaves shall be configured in the client configuration YAML file.
+They are used to ensure that the client only communicates with a trusted application.
+The fingerprint values in example below are just to demonstrate the syntax. 
+The format mirrors the content of the client configuration YAML file:
+
+[source,yaml,subs="attributes"]
+[%autofit]
+----
+AttestationEnclave:
+ # For debug config just ignore fingerprints.
+ EnclaveFingerprint: "{aemrenclave}"
+ SignerFingerprint: "{mrsigner}"
+CoreEnclave:
+ # For debug config just ignore fingerprints.
+ EnclaveFingerprint: "{cemrenclave}"
+ SignerFingerprint: "{mrsigner}"
+KeyEnclave:
+ # For debug config just ignore fingerprints.
+ EnclaveFingerprint: "{kemrenclave}"
+ SignerFingerprint: "{mrsigner}"
+----
+
+Fingerprint values need to be updated in the client configuration YAML file whenever the respective enclave on the server will be updated.
+
+=== For the Approval
+
+When the operator approves the dataflow configuration, they are displayed the fingerprint values of the task enclaves among other things.
+The fingerprint values are shown here for convenience but should be verified against the values that are received from the auditor.
+The following formatting or the task enclave fingerprint values mirrors the output of the `sharemind-hi-client` application:
+
+[source,yaml,subs="attributes"]
+[%autofit]
+----
+- Name: analytics_enclave
+  Enclave fingerprint: {eaemrenclave}
+  Signer fingerprint: {mrsigner}
+- Name: pseudonymisation_key_enclave
+  Enclave fingerprint: {epkemrenclave}
+  Signer fingerprint: {mrsigner}
+----
+
+== Document History
+
+* Version 1.0: Initial Version.
+* Version 1.1: Corrected and updated all enclave fingerprints.
+* Version 1.2: Updated enclave fingerprints.
